@@ -1,0 +1,490 @@
+From 6ba82c660955920435e70b4030297c5b7317d7a4 Mon Sep 17 00:00:00 2001
+From: kirliavc <jlc@pku.edu.cn>
+Date: Tue, 14 Apr 2026 18:10:43 +0800
+Subject: [PATCH] add xactivemask
+
+---
+ .../dispatch_ffn_combine_torch_adpt.h         | 56 ++++++++++---------
+ .../op_host/aclnn_dispatch_ffn_combine.cpp    | 19 ++-----
+ .../op_host/aclnn_dispatch_ffn_combine.h      |  2 +-
+ .../op_host/dispatch_ffn_combine_def.cpp      |  5 ++
+ .../op_host/dispatch_ffn_combine_tiling.cpp   | 19 +++++++
+ .../op_kernel/dispatch_ffn_combine.cpp        |  4 +-
+ .../op_kernel/dispatch_ffn_combine.h          |  8 ++-
+ .../op_kernel/dispatch_ffn_combine_kernel.hpp | 42 ++++++++++++++
+ .../moe_init_routing_quant_v2/moe_v2_common.h |  1 +
+ .../moe_v2_expert_token_out.h                 | 10 +++-
+ .../moe_v2_sort_multi_core.h                  |  9 +++
+ .../moe_v2_sort_one_core.h                    |  9 +++
+ 12 files changed, 136 insertions(+), 48 deletions(-)
+
+diff --git a/csrc/dispatch_ffn_combine/dispatch_ffn_combine_torch_adpt.h b/csrc/dispatch_ffn_combine/dispatch_ffn_combine_torch_adpt.h
+index 0eb95c8..3fadca0 100644
+--- a/csrc/dispatch_ffn_combine/dispatch_ffn_combine_torch_adpt.h
++++ b/csrc/dispatch_ffn_combine/dispatch_ffn_combine_torch_adpt.h
+@@ -9,7 +9,7 @@
+  *
+  * Unless required by applicable law or agreed to in writing, software
+  * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * WITHOUT WARRANTIES OF CONDITIONS OF ANY KIND, either express or implied.
+  * See the License for the specific language governing permissions and
+  * limitations under the License.
+  */
+@@ -25,6 +25,7 @@ std::tuple<at::Tensor&, at::Tensor&> dispatch_ffn_combine(
+     const at::TensorList& scale1,
+     const at::TensorList& scale2,
+     const at::Tensor& probs,
++    const c10::optional<at::Tensor>& x_active_mask,
+     c10::string_view group,
+     int64_t max_output_size,
+     at::Tensor& out,
+@@ -32,34 +33,39 @@ std::tuple<at::Tensor&, at::Tensor&> dispatch_ffn_combine(
+ ) {
+     char *group_ep_ptr = const_cast<char *>(group.data());
+     bool is_int8 = weight1[0].dtype() == at::kChar;
++    bool transB = false;
++    bool weightNz = true;
++
+     if (is_int8) {
+         EXEC_NPU_CMD(aclnnDispatchFFNCombine,
+-                 x,
+-                 weight1,
+-                 weight2,
+-                 expert_idx,
+-                 scale1,
+-                 scale2,
+-                 probs,
+-                 group_ep_ptr,
+-                 max_output_size,
+-                 out,
+-                 expert_token_nums);
++             x,
++             weight1,
++             weight2,
++             expert_idx,
++             scale1,
++             scale2,
++             probs,
++             x_active_mask.has_value() ? x_active_mask.value() : at::Tensor(),
++             group_ep_ptr,
++             max_output_size,
++             out,
++             expert_token_nums);
+     } else {
+         EXEC_NPU_CMD(aclnnDispatchFFNCombineBF16,
+-                 x,
+-                 weight1,
+-                 weight2,
+-                 expert_idx,
+-                 scale1,
+-                 scale2,
+-                 probs,
+-                 group_ep_ptr,
+-                 max_output_size,
+-                 out,
+-                 expert_token_nums);
+-    }    
++             x,
++             weight1,
++             weight2,
++             expert_idx,
++             scale1,
++             scale2,
++             probs,
++             x_active_mask.has_value() ? x_active_mask.value() : at::Tensor(),
++             group_ep_ptr,
++             max_output_size,
++             out,
++             expert_token_nums);
++    }
+     return {out, expert_token_nums};
+ }
+ }
+-#endif
+\ No newline at end of file
++#endif
+diff --git a/csrc/dispatch_ffn_combine/op_host/aclnn_dispatch_ffn_combine.cpp b/csrc/dispatch_ffn_combine/op_host/aclnn_dispatch_ffn_combine.cpp
+index 3799b09..92f7a03 100644
+--- a/csrc/dispatch_ffn_combine/op_host/aclnn_dispatch_ffn_combine.cpp
++++ b/csrc/dispatch_ffn_combine/op_host/aclnn_dispatch_ffn_combine.cpp
+@@ -9,11 +9,6 @@
+  */
+ #include "aclnn_dispatch_ffn_combine.h"
+ #include <algorithm>
+-// #include "aclnn_kernels/common/op_error_check.h"
+-// #include "opdev/op_log.h"
+-// #include "opdev/common_types.h"
+-// #include "opdev/platform.h"
+-// #include "ophost/matmul_util.h"
+ #include <unistd.h>
+ #include <vector>
+ #include <string>
+@@ -24,9 +19,6 @@
+ #include <sys/file.h>
+ #include <climits>
+ #include "../op_host/error_log.h"
+-// using namespace op;
+-
+-// using namespace op;
+ 
+ #ifdef __cplusplus
+ extern "C" {
+@@ -44,7 +36,7 @@ enum NnopbaseHcclServerType {
+ 
+ extern aclnnStatus aclnnInnerDispatchFFNCombineGetWorkspaceSize(const aclTensor* x, const aclTensorList* weight1, const aclTensorList* weight2,
+                                                          const aclTensor* expertId, const aclTensorList* scale1, const aclTensorList* scale2,
+-                                                         const aclTensor* probs,
++                                                         const aclTensor* probs, const aclTensor* xActiveMask,
+                                                          const char* group, int64_t maxOutputSize,
+                                                          bool transB, bool weightNz,
+                                                          const aclTensor* out, const aclTensor* expertTokenNums,
+@@ -53,19 +45,16 @@ extern aclnnStatus aclnnInnerDispatchFFNCombine(void *workspace, uint64_t worksp
+                                             aclOpExecutor *executor, aclrtStream stream);
+ extern "C" void __attribute__((weak)) NnopbaseSetHcclServerType(void *executor, NnopbaseHcclServerType sType);
+ 
+-
+-
+ aclnnStatus aclnnDispatchFFNCombineGetWorkspaceSize(const aclTensor* x, const aclTensorList* weight1, const aclTensorList* weight2,
+                                                     const aclTensor* expertId, const aclTensorList* scale1, const aclTensorList* scale2,
+-                                                    const aclTensor* probs,
++                                                    const aclTensor* probs, const aclTensor* xActiveMask,
+                                                     const char* group, int64_t maxOutputSize,
+                                                     const aclTensor* out, const aclTensor* expertTokenNums,
+                                                     uint64_t* workspaceSize, aclOpExecutor** executor)
+ {
+     bool transB = false;
+     bool weightNz = true;
+-
+-    aclnnStatus ret = aclnnInnerDispatchFFNCombineGetWorkspaceSize(x, weight1, weight2, expertId, scale1, scale2, probs, group, 
++    aclnnStatus ret = aclnnInnerDispatchFFNCombineGetWorkspaceSize(x, weight1, weight2, expertId, scale1, scale2, probs, xActiveMask, group,
+                                                                     maxOutputSize, transB, weightNz,
+                                                                     out, expertTokenNums, workspaceSize, executor);
+     return ret;
+@@ -81,4 +70,4 @@ aclnnStatus aclnnDispatchFFNCombine(void* workspace, uint64_t workspaceSize, acl
+ }
+ #ifdef __cplusplus
+ }
+-#endif
+\ No newline at end of file
++#endif
+diff --git a/csrc/dispatch_ffn_combine/op_host/aclnn_dispatch_ffn_combine.h b/csrc/dispatch_ffn_combine/op_host/aclnn_dispatch_ffn_combine.h
+index 556e501..4941a4a 100644
+--- a/csrc/dispatch_ffn_combine/op_host/aclnn_dispatch_ffn_combine.h
++++ b/csrc/dispatch_ffn_combine/op_host/aclnn_dispatch_ffn_combine.h
+@@ -41,7 +41,7 @@ extern "C" {
+  */
+ __attribute__((visibility("default"))) aclnnStatus aclnnDispatchFFNCombineGetWorkspaceSize(const aclTensor* x, const aclTensorList* weight1, const aclTensorList* weight2,
+                                                                                         const aclTensor* expertId, const aclTensorList* scale1, const aclTensorList* scale2,
+-                                                                                        const aclTensor* probs,
++                                                                                        const aclTensor* probs, const aclTensor* xActiveMask,
+                                                                                         const char* group, int64_t maxOutputSize,
+                                                                                         const aclTensor* out, const aclTensor* expertTokenNums,
+                                                                                         uint64_t* workspaceSize, aclOpExecutor** executor);
+diff --git a/csrc/dispatch_ffn_combine/op_host/dispatch_ffn_combine_def.cpp b/csrc/dispatch_ffn_combine/op_host/dispatch_ffn_combine_def.cpp
+index a393fed..bbcbe7e 100644
+--- a/csrc/dispatch_ffn_combine/op_host/dispatch_ffn_combine_def.cpp
++++ b/csrc/dispatch_ffn_combine/op_host/dispatch_ffn_combine_def.cpp
+@@ -55,6 +55,11 @@ class DispatchFFNCombine : public OpDef {
+         .DataType({ge::DT_FLOAT, ge::DT_FLOAT, ge::DT_FLOAT})
+         .Format({ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND})
+         .UnknownShapeFormat({ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND});
++    this->Input("xActiveMaskOptional")
++        .ParamType(OPTIONAL)
++        .DataType({ge::DT_BOOL, ge::DT_BOOL, ge::DT_BOOL})
++        .Format({ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND})
++        .UnknownShapeFormat({ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND});
+ 
+     // Output
+     this->Output("out")
+diff --git a/csrc/dispatch_ffn_combine/op_host/dispatch_ffn_combine_tiling.cpp b/csrc/dispatch_ffn_combine/op_host/dispatch_ffn_combine_tiling.cpp
+index d41d4d9..5c3e74d 100644
+--- a/csrc/dispatch_ffn_combine/op_host/dispatch_ffn_combine_tiling.cpp
++++ b/csrc/dispatch_ffn_combine/op_host/dispatch_ffn_combine_tiling.cpp
+@@ -42,6 +42,7 @@ namespace {
+     constexpr uint32_t WEIGHT_INDEX = 1;
+     constexpr uint32_t WEIGHT2_INDEX = 2;
+     constexpr uint32_t EXPERTID_INDEX = 3;
++    constexpr uint32_t X_ACTIVE_MASK_INDEX = 7;
+     constexpr uint32_t BLOCK_NUM = 20;
+     constexpr uint32_t SYSTEM_NEED_WORKSPACE = 16 * 1024 * 1024;
+     constexpr uint64_t MB_SIZE = 1024 * 1024UL;
+@@ -174,6 +175,21 @@ static ge::graphStatus DispatchFFNCombineGetPlatformInfoAndSetTiling(gert::Tilin
+     return ge::GRAPH_SUCCESS;
+ }
+ 
++static ge::graphStatus CheckXActiveMaskShape(gert::TilingContext *context, const char *nodeName, DispatchFFNCombineInfo &info)
++{
++    const gert::StorageShape* xActiveMaskStorageShape = context->GetOptionalInputShape(X_ACTIVE_MASK_INDEX);
++    if (xActiveMaskStorageShape != nullptr) {
++        OP_TILING_CHECK(xActiveMaskStorageShape->GetStorageShape().GetDimNum() != 1,
++            OP_LOGE(nodeName, "xActiveMask shape dims must be 1, but current dim num is %lu.",
++                xActiveMaskStorageShape->GetStorageShape().GetDimNum()), return ge::GRAPH_FAILED);
++        const int64_t xActiveMaskDim0 = xActiveMaskStorageShape->GetStorageShape().GetDim(0);
++        OP_TILING_CHECK(xActiveMaskDim0 != static_cast<int64_t>(info.M),
++            OP_LOGE(nodeName, "xActiveMask Dim0 must be M(%u), but current dim is %lu.", info.M, xActiveMaskDim0),
++            return ge::GRAPH_FAILED);
++    }
++    return ge::GRAPH_SUCCESS;
++}
++
+ void SetTilingData(CoCTiling &cocTilingData, DispatchFFNCombineInfo &info)
+ {
+     cocTilingData.m0 = 128;
+@@ -214,6 +230,9 @@ static ge::graphStatus DispatchFFNCombineTilingFuncImpl(gert::TilingContext *con
+     OP_TILING_CHECK(DispatchFFNCombineGetPlatformInfoAndSetTiling(context, info) != ge::GRAPH_SUCCESS,
+         OP_LOGE(context->GetNodeName(), "DispatchFFNCombine GetPlatformInfoAndSetTiling Failed"),
+         return ge::GRAPH_FAILED);
++    OP_TILING_CHECK(CheckXActiveMaskShape(context, nodeName, info) != ge::GRAPH_SUCCESS,
++        OP_LOGE(context->GetNodeName(), "DispatchFFNCombine CheckXActiveMaskShape Failed"),
++        return ge::GRAPH_FAILED);
+ 
+     SetTilingData(tilingData->cocTiling, info);
+ 
+diff --git a/csrc/dispatch_ffn_combine/op_kernel/dispatch_ffn_combine.cpp b/csrc/dispatch_ffn_combine/op_kernel/dispatch_ffn_combine.cpp
+index 86680f3..815c136 100644
+--- a/csrc/dispatch_ffn_combine/op_kernel/dispatch_ffn_combine.cpp
++++ b/csrc/dispatch_ffn_combine/op_kernel/dispatch_ffn_combine.cpp
+@@ -20,14 +20,14 @@
+ using namespace AscendC;
+ using namespace DispatchFFNCombineImpl;
+ extern "C" __global__ __aicore__ void dispatch_ffn_combine(GM_ADDR x, GM_ADDR w1, GM_ADDR w2,  GM_ADDR expertId, GM_ADDR scale1, GM_ADDR scale2, GM_ADDR probs,
+-    GM_ADDR c, GM_ADDR expertTokenNums, GM_ADDR workspaceGM,  GM_ADDR tilingGM)
++    GM_ADDR xActiveMask, GM_ADDR c, GM_ADDR expertTokenNums, GM_ADDR workspaceGM,  GM_ADDR tilingGM)
+ {
+     REGISTER_TILING_DEFAULT(DispatchFFNCombineTilingData);
+     if (TILING_KEY_IS(1000010)) {
+         KERNEL_TASK_TYPE(1000010, KERNEL_TYPE_MIX_AIC_1_2);
+         GET_TILING_DATA_WITH_STRUCT(DispatchFFNCombineTilingData, tilingData, tilingGM);
+         DispatchFFNCombine<int8_t, DTYPE_W1, DTYPE_OUT, false, true> op;
+-        op.Init(x, w1, w2, expertId, scale1, scale2, probs, c, expertTokenNums, workspaceGM, tilingGM);
++        op.Init(x, w1, w2, expertId, scale1, scale2, probs, xActiveMask, c, expertTokenNums, workspaceGM, tilingGM);
+         op.Process();
+     }
+ }
+\ No newline at end of file
+diff --git a/csrc/dispatch_ffn_combine/op_kernel/dispatch_ffn_combine.h b/csrc/dispatch_ffn_combine/op_kernel/dispatch_ffn_combine.h
+index 4e73b83..1256c94 100644
+--- a/csrc/dispatch_ffn_combine/op_kernel/dispatch_ffn_combine.h
++++ b/csrc/dispatch_ffn_combine/op_kernel/dispatch_ffn_combine.h
+@@ -55,7 +55,7 @@ class DispatchFFNCombine {
+ public:
+     __aicore__ inline DispatchFFNCombine() {};
+     __aicore__ inline void Init(GM_ADDR xGM, GM_ADDR weight1GM, GM_ADDR weight2GM, GM_ADDR expertIdGM, GM_ADDR scale1GM, GM_ADDR scale2GM,
+-                                GM_ADDR probs, GM_ADDR outGM, GM_ADDR expertTokenNums, GM_ADDR workspaceGM, GM_ADDR tilingGM);
++                                GM_ADDR probs, GM_ADDR xActiveMaskGM, GM_ADDR outGM, GM_ADDR expertTokenNums, GM_ADDR workspaceGM, GM_ADDR tilingGM);
+     __aicore__ inline void Process();
+ 
+ 
+@@ -67,6 +67,7 @@ private:
+     GM_ADDR scale1GM_;
+     GM_ADDR scale2GM_;
+     GM_ADDR probs_;
++    GM_ADDR xActiveMaskGM_;
+     GM_ADDR outGM_;
+     GM_ADDR gmExpertTokenNums_;
+     GM_ADDR workspaceGM_;
+@@ -113,7 +114,7 @@ private:
+ 
+ template <TemplateMMA2AClass>
+ __aicore__ inline void DispatchFFNCombine<TemplateMMA2ACFunc>::Init(GM_ADDR xGM, GM_ADDR weight1GM, GM_ADDR weight2GM, GM_ADDR expertIdGM, GM_ADDR scale1GM, GM_ADDR scale2GM,
+-                                                                    GM_ADDR probs, GM_ADDR outGM, GM_ADDR expertTokenNums, GM_ADDR workspaceGM, GM_ADDR tilingGM)
++                                                                    GM_ADDR probs, GM_ADDR xActiveMaskGM, GM_ADDR outGM, GM_ADDR expertTokenNums, GM_ADDR workspaceGM, GM_ADDR tilingGM)
+ {
+     REGISTER_TILING_DEFAULT(DispatchFFNCombineTilingData);
+     auto tiling = (__gm__ DispatchFFNCombineTilingData*)tilingGM;
+@@ -126,6 +127,7 @@ __aicore__ inline void DispatchFFNCombine<TemplateMMA2ACFunc>::Init(GM_ADDR xGM,
+     scale1GM_ = scale1GM;
+     scale2GM_ = scale2GM;
+     probs_ = probs;
++    xActiveMaskGM_ = xActiveMaskGM;
+ 
+     outGM_ = outGM;
+     gmExpertTokenNums_ = expertTokenNums;
+@@ -270,7 +272,7 @@ __aicore__ inline void DispatchFFNCombine<TemplateMMA2ACFunc>::Process()
+         outGM_, layoutD1, layoutD2,
+         expertIdGM_, moeInitRoutingQuantV2Scale, moeInitRoutingQuantV2Offset,
+         expertTokensBeforeCapacity, probs_,
+-        workspaceGM_, gmExpertTokenNums_, ubMoveNum, moeInitRoutingQuantV2TilingData};
++        workspaceGM_, gmExpertTokenNums_, ubMoveNum, xActiveMaskGM_, moeInitRoutingQuantV2TilingData};
+     //Call kernel
+     MatmulKernel kernel(params);
+     kernel(params);
+diff --git a/csrc/dispatch_ffn_combine/op_kernel/dispatch_ffn_combine_kernel.hpp b/csrc/dispatch_ffn_combine/op_kernel/dispatch_ffn_combine_kernel.hpp
+index df7d88f..a273a59 100644
+--- a/csrc/dispatch_ffn_combine/op_kernel/dispatch_ffn_combine_kernel.hpp
++++ b/csrc/dispatch_ffn_combine/op_kernel/dispatch_ffn_combine_kernel.hpp
+@@ -131,6 +131,7 @@ public:
+         GM_ADDR expertTokensBeforeCapacity;
+         GM_ADDR dynamicQuantScale;
+         GM_ADDR probs;
++        GM_ADDR ptrXActiveMask;
+         int64_t topK;
+         uint64_t initRoutingQuantTilingKey;
+         uint32_t epilogueCoreNum;
+@@ -158,6 +159,7 @@ public:
+             GM_ADDR moeInitRoutingQuantV2Offset_,
+             GM_ADDR expertTokensBeforeCapacity_, GM_ADDR probs_,
+             GM_ADDR ptrWorkspace_, GM_ADDR gmExpertTokenNums_, int32_t ubMoveNum_,
++            GM_ADDR ptrXActiveMask_,
+             optiling::MoeInitRoutingQuantV2TilingData moeInitRoutingQuantV2TilingData_
+         ) : problemShape(problemShape_),
+             EP(EP_), listLen(listLen_), expertPerRank(expertPerRank_), maxOutputSize(maxOutputSize_),
+@@ -174,6 +176,7 @@ public:
+             moeInitRoutingQuantV2Offset(moeInitRoutingQuantV2Offset_), 
+             expertTokensBeforeCapacity(expertTokensBeforeCapacity_), probs(probs_),
+             ptrWorkspace(ptrWorkspace_), ptrExpertTokenNums(gmExpertTokenNums_), ubMoveNum(ubMoveNum_),
++            ptrXActiveMask(ptrXActiveMask_),
+             moeInitRoutingQuantV2TilingData(moeInitRoutingQuantV2TilingData_)
+         {
+         }
+@@ -239,6 +242,7 @@ private:
+         tokenPerExpert.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t *>(shmem() + peermemInfo.offsetPeerTokenPerExpert));
+         tokenPerExpertLayout = Layout3D(AlignUp(params.EP * params.expertPerRank, ALIGN_128), params.expertPerRank);
+         preSumBeforeRank.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(workspaceInfo.ptrSumBeforeRank));
++        gmXActiveMask.SetGlobalBuffer(reinterpret_cast<__gm__ bool*>(params.ptrXActiveMask));
+     }
+ 
+     template<typename T>
+@@ -339,6 +343,40 @@ private:
+         AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID1);
+     }
+ 
++    CATLASS_DEVICE
++    void ApplyXActiveMask(Params const &params) {
++        if (params.ptrXActiveMask == nullptr) {
++            return;
++        }
++        int32_t m = params.problemShape.m();
++        int32_t topK = params.topK;
++        int32_t expertNum = params.expertPerRank * params.EP;
++        AscendC::GlobalTensor<int32_t> expertIdxGm;
++        expertIdxGm.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(params.expertIdx));
++
++        int32_t totalElements = m * topK;
++        int32_t elementsPerCore = CeilDiv(totalElements, coreNum);
++        int32_t startIdx = coreIdx * elementsPerCore;
++        int32_t endIdx = std::min(startIdx + elementsPerCore, totalElements);
++
++        AscendC::LocalTensor<int32_t> tmpExpertIdx = resource.ubBuf.template GetBufferByByte<int32_t>(0);
++        int32_t copySize = endIdx - startIdx;
++
++        AscendC::DataCopy(tmpExpertIdx, expertIdxGm[startIdx], copySize);
++
++        for (int32_t i = 0; i < copySize; ++i) {
++            int32_t tokenIdx = (startIdx + i) / topK;
++            bool isActive = gmXActiveMask[tokenIdx];
++            if (!isActive) {
++                tmpExpertIdx.SetValue(i, expertNum);
++            }
++        }
++
++        AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
++        AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
++        AscendC::DataCopy(expertIdxGm[startIdx], tmpExpertIdx, copySize);
++    }
++
+     CATLASS_DEVICE
+     void GetCumsumForMMAIV(AscendC::GlobalTensor<int32_t> & tokenPerExpert, AscendC::GlobalTensor<int32_t> & result, uint32_t expertPerRank, uint32_t rankId, uint32_t EP)
+     {
+@@ -747,6 +785,8 @@ private:
+         GM_ADDR localTokenPerExpert = shmem() + localTokenPerExpertOffset;     // Place the entire communication matrix in peermem
+         uint32_t expandedRowIdxOffset = AlignUp(params.problemShape.m(), 256) * params.topK * sizeof(int32_t);
+ 
++        ApplyXActiveMask(params);
++
+         //---initRouting------
+         moe_init_routing_quant_v2<ElementD2>(reinterpret_cast<GM_ADDR> (params.ptrA), params.expertIdx, 
+         params.moeInitRoutingQuantV2Scale, params.moeInitRoutingQuantV2Offset, shmem() + peermemInfo.offsetA, 
+@@ -1087,6 +1127,8 @@ private:
+     AscendC::GlobalTensor<ElementPerTokenScale> gmPerTokenScale1;
+     AscendC::GlobalTensor<ElementPerTokenScale> gmPerTokenScale2;
+ 
++    AscendC::GlobalTensor<bool> gmXActiveMask;
++
+     AscendC::GlobalTensor<int32_t> tokenPerExpert;
+     AscendC::GlobalTensor<int32_t> cumsumMM;
+     AscendC::GlobalTensor<int32_t> preSumBeforeRank;
+diff --git a/csrc/dispatch_ffn_combine/op_kernel/moe_init_routing_quant_v2/moe_v2_common.h b/csrc/dispatch_ffn_combine/op_kernel/moe_init_routing_quant_v2/moe_v2_common.h
+index e362f50..ad6364a 100644
+--- a/csrc/dispatch_ffn_combine/op_kernel/moe_init_routing_quant_v2/moe_v2_common.h
++++ b/csrc/dispatch_ffn_combine/op_kernel/moe_init_routing_quant_v2/moe_v2_common.h
+@@ -23,6 +23,7 @@ using namespace optiling;
+ constexpr int64_t SPLIT_N = 0;
+ constexpr int64_t SPLIT_K = 1;
+ constexpr float MIN_FP32 = -3.4e38;
++constexpr float MAX_FP32 = 3.4e38;
+ constexpr int64_t ONE_REPEAT_SORT_NUM = 32;
+ constexpr int64_t BLOCK_BYTES = 32;
+ constexpr int64_t INT32_ONE_BLOCK_NUM = 8;
+diff --git a/csrc/dispatch_ffn_combine/op_kernel/moe_init_routing_quant_v2/moe_v2_expert_token_out.h b/csrc/dispatch_ffn_combine/op_kernel/moe_init_routing_quant_v2/moe_v2_expert_token_out.h
+index ab14c24..18502fb 100644
+--- a/csrc/dispatch_ffn_combine/op_kernel/moe_init_routing_quant_v2/moe_v2_expert_token_out.h
++++ b/csrc/dispatch_ffn_combine/op_kernel/moe_init_routing_quant_v2/moe_v2_expert_token_out.h
+@@ -112,6 +112,9 @@ __aicore__ inline void MoeV2ExpertTokenOut::CopyIn(int64_t progress) {
+ }
+ 
+ __aicore__ inline void MoeV2ExpertTokenOut::GetExpertTokenCount(int32_t curExpertId) {
++  if (curExpertId >= this->expertNum) {
++    return;
++  }
+   this->tokenCount++;
+   if (this->lastExpertId < curExpertId) {
+     this->expertTokenIdxOutLocal.SetValue(this->expertIdx, this->tokenCount - 1);
+@@ -135,8 +138,11 @@ __aicore__ inline void MoeV2ExpertTokenOut::Compute(int64_t progress) {
+   LocalTensor<int32_t> inLocal = copyInQueue.DeQue<int32_t>();
+   SetWaitFlag<HardEvent::MTE2_S>(HardEvent::MTE2_S);
+   if (this->lastExpertId == -1) {
+-    this->lastExpertId = inLocal.GetValue(0);
+-    this->firstExpertId = this->lastExpertId;
++    int32_t firstExpertIdVal = inLocal.GetValue(0);
++    if (firstExpertIdVal < this->expertNum) {
++      this->lastExpertId = firstExpertIdVal;
++      this->firstExpertId = this->lastExpertId;
++    }
+   }
+   for (int64_t i = 0; i < currentLoopRows; i++) {
+     int32_t expertId = inLocal.GetValue(i);
+diff --git a/csrc/dispatch_ffn_combine/op_kernel/moe_init_routing_quant_v2/moe_v2_sort_multi_core.h b/csrc/dispatch_ffn_combine/op_kernel/moe_init_routing_quant_v2/moe_v2_sort_multi_core.h
+index 8db224e..71c61ed 100644
+--- a/csrc/dispatch_ffn_combine/op_kernel/moe_init_routing_quant_v2/moe_v2_sort_multi_core.h
++++ b/csrc/dispatch_ffn_combine/op_kernel/moe_init_routing_quant_v2/moe_v2_sort_multi_core.h
+@@ -107,6 +107,15 @@ __aicore__ inline void MoeV2SortMultiCore::UBSortCompute(int64_t progress, int64
+   expertForSourceRowLocalFp32 = expertForSourceRowLocal.ReinterpretCast<float>();
+   Cast(expertForSourceRowLocalFp32, expertForSourceRowLocal, RoundMode::CAST_ROUND, sortNum);
+   AscendC::PipeBarrier<PIPE_V>();
++
++  float expertNumFloat = static_cast<float>(this->expertNum);
++  LocalTensor<float> isValidMask = tempBuffer.Get<float>(size);
++  Compare(isValidMask, expertForSourceRowLocalFp32, expertNumFloat, CMPMODE::LT, size);
++  float invalidValue = -MAX_FP32;
++  Select(expertForSourceRowLocalFp32, isValidMask, expertForSourceRowLocalFp32, invalidValue, isValidMask,
++         SELMODE::VSEL, size);
++
++  AscendC::PipeBarrier<PIPE_V>();
+   Muls(expertForSourceRowLocalFp32, expertForSourceRowLocalFp32, (float)-1, sortNum);
+   AscendC::PipeBarrier<PIPE_V>();
+ 
+diff --git a/csrc/dispatch_ffn_combine/op_kernel/moe_init_routing_quant_v2/moe_v2_sort_one_core.h b/csrc/dispatch_ffn_combine/op_kernel/moe_init_routing_quant_v2/moe_v2_sort_one_core.h
+index c370ef0..6b62594 100644
+--- a/csrc/dispatch_ffn_combine/op_kernel/moe_init_routing_quant_v2/moe_v2_sort_one_core.h
++++ b/csrc/dispatch_ffn_combine/op_kernel/moe_init_routing_quant_v2/moe_v2_sort_one_core.h
+@@ -57,6 +57,15 @@ __aicore__ inline void MoeV2SortOneCore::SortCompute() {
+   LocalTensor<float> expertForSourceRowLocalFp32 = expertForSourceRowLocal.ReinterpretCast<float>();
+   Cast(expertForSourceRowLocalFp32, expertForSourceRowLocal, RoundMode::CAST_ROUND, this->tileLength);
+   AscendC::PipeBarrier<PIPE_V>();
++
++  float expertNumFloat = static_cast<float>(this->expertNum);
++  LocalTensor<float> isValidMask = tempBuffer.Get<float>(this->tileLength);
++  Compare(isValidMask, expertForSourceRowLocalFp32, expertNumFloat, CMPMODE::LT, this->tileLength);
++  float invalidValue = -MAX_FP32;
++  Select(expertForSourceRowLocalFp32, isValidMask, expertForSourceRowLocalFp32, invalidValue, isValidMask,
++         SELMODE::VSEL, this->tileLength);
++
++  AscendC::PipeBarrier<PIPE_V>();
+   Muls(expertForSourceRowLocalFp32, expertForSourceRowLocalFp32, (float)-1, this->tileLength);
+   AscendC::PipeBarrier<PIPE_V>();
+ 
+-- 
+2.31.1.windows.1
+
